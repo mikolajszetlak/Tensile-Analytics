@@ -8,7 +8,7 @@ import re
 
 # Konfiguracja strony
 st.set_page_config(
-    page_title="Tensile Analytics Pro | ISO 6892-1 / ASTM E8",
+    page_title="Tensile Analytics  | SZETLAK",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -240,7 +240,7 @@ def process_tensile_dataset(
     }
 
 # --- INTERFEJS UŻYTKOWNIKA STREAMLIT ---
-st.title("🔬 Moduł Zaawansowanej Analizy Próby Rozciągania")
+st.title("🔬 Moduł Analizy Próby Rozciągania")
 st.caption("Standardy metrologiczne: PN-EN ISO 6892-1 / ASTM E8M (Obsługa Excel & CSV z Kompensacją Luzu)")
 
 with st.sidebar:
