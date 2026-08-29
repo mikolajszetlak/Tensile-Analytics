@@ -4,3 +4,4 @@ __pycache__/
 .DS_Store
 data/raw/*.xlsx
 data/raw/*.xls
+tensile_report.py
