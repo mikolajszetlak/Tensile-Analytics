@@ -12,7 +12,58 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- SILNIK OBLICZENIOWY ---
+# --- UNIWERSALNE FUNKCJE ODCZYTU (EXCEL & CSV) ---
+def load_raw_dataframe(file_obj, item_name, header_row=None, nrows=None, skip_after=0):
+    """
+    Uniwersalny parser odczytujący wycinek danych z pliku Excel lub CSV.
+    Obsługuje automatyczne wykrywanie separatorów (;, ,, tab) oraz kodowania CP1250 / UTF-8.
+    """
+    file_name = file_obj.name.lower()
+    
+    if file_name.endswith(('.xlsx', '.xls')):
+        df = pd.read_excel(file_obj, sheet_name=item_name, header=header_row, nrows=nrows)
+        if header_row is not None and skip_after > 0:
+            df = df.iloc[int(skip_after):].reset_index(drop=True)
+        return df
+        
+    elif file_name.endswith('.csv'):
+        file_obj.seek(0)
+        # Próba odczytu z automatycznym wykrywaniem separatora
+        try:
+            df = pd.read_csv(
+                file_obj,
+                header=header_row,
+                nrows=nrows,
+                sep=None,
+                engine='python',
+                encoding='utf-8'
+            )
+        except UnicodeDecodeError:
+            file_obj.seek(0)
+            df = pd.read_csv(
+                file_obj,
+                header=header_row,
+                nrows=nrows,
+                sep=None,
+                engine='python',
+                encoding='cp1250'
+            )
+            
+        if header_row is not None and skip_after > 0:
+            df = df.iloc[int(skip_after):].reset_index(drop=True)
+            
+        return df
+    return pd.DataFrame()
+
+def parse_numeric_series(series: pd.Series) -> np.ndarray:
+    """Konwertuje serię danych na float64, uwzględniając europejskie przecinki dziesiętne."""
+    if series.dtype == object:
+        # Zamiana przecinków dziesiętnych na kropki (np. "12,5" -> "12.5")
+        cleaned = series.astype(str).str.replace(',', '.', regex=False).str.strip()
+        return pd.to_numeric(cleaned, errors='coerce').to_numpy(dtype=np.float64)
+    return pd.to_numeric(series, errors='coerce').to_numpy(dtype=np.float64)
+
+# --- SILNIK OBLICZENIOWY ISO 6892-1 ---
 def process_tensile_dataset(
     df_raw: pd.DataFrame,
     force_col: str,
@@ -21,24 +72,20 @@ def process_tensile_dataset(
     disp_unit: str,
     l0: float,
     s0: float,
-    sheet_name: str
+    sample_id: str
 ):
-    """
-    Deterministyczny silnik wyznaczania parametrów wytrzymałościowych (ISO 6892-1 / ASTM E8M).
-    Zawiera filtrację uślizgu uchwytów, dynamiczny fallback i zabezpieczenie numeryczne.
-    """
-    # 1. Konwersja numeryczna i czyszczenie
-    force_series = pd.to_numeric(df_raw[force_col], errors='coerce')
-    disp_series = pd.to_numeric(df_raw[disp_col], errors='coerce')
+    """Deterministyczny silnik wyznaczania parametrów ISO 6892-1 / ASTM E8M."""
+    raw_force = parse_numeric_series(df_raw[force_col])
+    raw_disp = parse_numeric_series(df_raw[disp_col])
     
-    clean_mask = force_series.notna() & disp_series.notna()
-    force_arr = force_series[clean_mask].to_numpy(dtype=np.float64)
-    disp_arr = disp_series[clean_mask].to_numpy(dtype=np.float64)
+    clean_mask = np.isfinite(raw_force) & np.isfinite(raw_disp)
+    force_arr = raw_force[clean_mask]
+    disp_arr = raw_disp[clean_mask]
     
     if len(force_arr) < 20:
         return None
 
-    # 2. Standaryzacja do układu bazowego: Siła [N], Przemieszczenie [mm]
+    # Standaryzacja do jednostek SI: Siła [N], Droga [mm]
     if force_unit == "kN":
         force_arr = force_arr * 1e3
     elif force_unit == "MN":
@@ -49,23 +96,20 @@ def process_tensile_dataset(
     elif disp_unit == "m":
         disp_arr = disp_arr * 1e3
 
-    # 3. Wyznaczenie wektorów naprężeń sigma [MPa] i odkształceń epsilon [-]
     stress = force_arr / s0
     strain = disp_arr / l0
     
-    # 4. Parametry wytrzymałościowe graniczne (Rm, Ru, A)
     rm_idx = int(np.argmax(stress))
     if rm_idx < 5:
         rm_idx = len(stress) - 1
         
     fm_kn = float(force_arr[rm_idx] / 1000.0)
     rm_mpa = float(stress[rm_idx])
-    
     fu_kn = float(force_arr[-1] / 1000.0)
     ru_mpa = float(stress[-1])
     a_pct = float(strain[-1] * 100.0)
     
-    # 5. Ograniczenie przestrzeni poszukiwań strefy Hooke'a (odcięcie uślizgu uchwytów)
+    # Filtracja uślizgu uchwytów (15% - 75% Rm)
     stress_min_cutoff = 0.15 * rm_mpa
     stress_max_cutoff = 0.75 * rm_mpa
     
@@ -78,7 +122,6 @@ def process_tensile_dataset(
     if len(search_indices) < 15:
         search_indices = np.arange(0, max(15, int(rm_idx * 0.75)))
 
-    # 6. Adaptacyjne ruchome okno szukające bezwzględnego maksimum sztywności
     window_size = max(6, min(50, int(len(search_indices) * 0.25)))
     best_slope = 0.0
     best_intercept = 0.0
@@ -118,17 +161,16 @@ def process_tensile_dataset(
                 best_r2 = r2
                 best_idx = cur_idx_window[0]
 
-    # Bezpiecznik przed dzieleniem przez zero
     if best_slope <= 0.0:
         delta_e = strain[rm_idx] - strain[0]
         best_slope = (stress[rm_idx] - stress[0]) / delta_e if delta_e > 0 else 1000.0
         best_intercept = stress[0] - best_slope * strain[0]
 
-    # 7. Kompensacja luzu początkowego (Toe Compensation)
+    # Kompensacja luzu początkowego (Toe compensation)
     toe_offset = -best_intercept / best_slope
     strain_corr = strain - toe_offset
     
-    # 8. Wyznaczenie Rp0.2 (Offset 0.2%)
+    # Wyznaczenie Rp0.2
     sigma_offset = best_slope * (strain_corr - 0.002)
     diff = stress - sigma_offset
     
@@ -148,7 +190,7 @@ def process_tensile_dataset(
                 break
                 
     return {
-        "sheet": str(sheet_name),
+        "sample_id": str(sample_id),
         "Fm_kN": fm_kn,
         "Rm_MPa": rm_mpa,
         "Rm_strain_pct": float(strain_corr[rm_idx] * 100.0),
@@ -163,35 +205,48 @@ def process_tensile_dataset(
         "toe_offset_pct": toe_offset * 100.0
     }
 
-# --- INTERFEJS UŻYTKOWNIKA ---
+# --- INTERFEJS UŻYTKOWNIKA STREAMLIT ---
 st.title("🔬 Moduł Zaawansowanej Analizy Próby Rozciągania")
-st.caption("Standardy metrologiczne: PN-EN ISO 6892-1 / ASTM E8M (Deterministyczna Kompensacja Luzu)")
+st.caption("Standardy metrologiczne: PN-EN ISO 6892-1 / ASTM E8M (Obsługa Excel & CSV, Kompensacja Luzu)")
 
 with st.sidebar:
-    st.header("⚙️ 1. Plik Źródłowy")
-    uploaded_file = st.file_uploader("Załaduj arkusz pomiarowy (.xlsx, .xls)", type=["xlsx", "xls"])
+    st.header("⚙️ 1. Pliki Wejściowe")
+    uploaded_files = st.file_uploader(
+        "Załaduj pliki pomiarowe (.xlsx, .xls, .csv)",
+        type=["xlsx", "xls", "csv"],
+        accept_multiple_files=True
+    )
 
-if not uploaded_file:
-    st.info("👆 Załaduj plik Excel z wynikami próby rozciągania w lewym panelu, aby rozpocząć pracę.")
+if not uploaded_files:
+    st.info("👆 Przeciągnij plik(i) Excel lub CSV w lewym panelu, aby rozpocząć przetwarzanie danych.")
 else:
-    xl_doc = pd.ExcelFile(uploaded_file)
-    available_sheets = xl_doc.sheet_names
-    
-    # SEKCJA INSPEKCJI SUROWYCH WIERSZY
-    with st.expander("🔍 Podgląd Surowego Nagłówka i Metadanych Próbki (Wskaźnik Wierszy)", expanded=True):
+    # Budowa rejestru próbek (Mapowanie: Pliki CSV / Arkusze Excel)
+    sample_registry = {}
+    for f in uploaded_files:
+        if f.name.lower().endswith(('.xlsx', '.xls')):
+            xl = pd.ExcelFile(f)
+            for sheet in xl.sheet_names:
+                sample_registry[f"{f.name} -> {sheet}"] = {"file": f, "item": sheet, "type": "excel"}
+        else:
+            sample_registry[f.name] = {"file": f, "item": f.name, "type": "csv"}
+            
+    sample_keys = list(sample_registry.keys())
+
+    # SEKCJA INSPEKCJI SUROWYCH DANYCH
+    with st.expander("🔍 Podgląd Surowego Nagłówka i Metadanych (Wskaźnik Wierszy)", expanded=True):
         col_insp1, col_insp2 = st.columns([3, 1])
         with col_insp1:
-            preview_sheet = st.selectbox("Wybierz arkusz do inspekcji nagłówka:", available_sheets, key="insp_sheet")
+            selected_preview_key = st.selectbox("Wybierz próbkę do inspekcji nagłówka:", sample_keys)
         with col_insp2:
-            n_rows_preview = st.number_input("Liczba wierszy do wyświetlenia:", min_value=3, max_value=30, value=10, step=1)
+            n_rows_preview = st.number_input("Wiersze do wyświetlenia:", min_value=3, max_value=30, value=10, step=1)
             
-        # Wczytanie surowych wierszy bez nagłówka
-        df_raw_preview = pd.read_excel(uploaded_file, sheet_name=preview_sheet, header=None, nrows=int(n_rows_preview))
-        
-        # Formatowanie indeksu jako "Wiersz X" dla jednoznacznej identyfikacji
+        target_meta = sample_registry[selected_preview_key]
+        df_raw_preview = load_raw_dataframe(
+            target_meta["file"], target_meta["item"], header_row=None, nrows=int(n_rows_preview)
+        )
         df_raw_preview.index = [f"Wiersz {i}" for i in range(len(df_raw_preview))]
         st.dataframe(df_raw_preview, use_container_width=True)
-        st.caption("💡 Sprawdź powyżej: w którym wierszu znajdują się $L_0$ i $S_0$ oraz od którego wiersza zaczynają się nazwy kolumn.")
+        st.caption("💡 Zidentyfikuj powyżej wiersz z nazwami kolumn oraz wartości $L_0$ i $S_0$.")
 
     with st.sidebar:
         st.markdown("---")
@@ -205,30 +260,26 @@ else:
         st.markdown("---")
         st.header("🛠️ 3. Konfiguracja Struktury Danych")
         header_row_idx = st.number_input(
-            "Indeks wiersza z nagłówkami kolumn (np. 5):",
+            "Indeks wiersza z nagłówkami kolumn:",
             value=5,
             min_value=0,
             max_value=50,
-            step=1,
-            help="Numer wiersza z nazwami kolumn odczytany z tabeli inspekcji powyżej."
+            step=1
         )
-        
         skip_after_header = st.number_input(
             "Pomiń wiersze pod nagłówkiem (np. jednostki):",
             value=1,
             min_value=0,
             max_value=10,
-            step=1,
-            help="Liczba wierszy z jednostkami bezpośrednio pod nagłówkiem (np. s, N, mm)."
+            step=1
         )
 
-    # Odczyt roboczy arkusza po konfiguracji nagłówków
-    df_preview = pd.read_excel(uploaded_file, sheet_name=available_sheets[0], header=int(header_row_idx))
-    if skip_after_header > 0:
-        df_preview = df_preview.iloc[int(skip_after_header):].reset_index(drop=True)
-        
-    df_preview.columns = [str(col).strip() for col in df_preview.columns]
-    column_options = df_preview.columns.tolist()
+    # Odczyt roboczy nagłówków na wybranej próbce
+    df_sample_preview = load_raw_dataframe(
+        target_meta["file"], target_meta["item"], header_row=int(header_row_idx), skip_after=int(skip_after_header)
+    )
+    df_sample_preview.columns = [str(col).strip() for col in df_sample_preview.columns]
+    column_options = df_sample_preview.columns.tolist()
 
     with st.sidebar:
         st.markdown("---")
@@ -245,28 +296,29 @@ else:
         st.markdown("---")
         st.header("📊 5. Tryb Analizy")
         analysis_mode = st.radio(
-            "Wybierz tryb generowania raportu:",
-            ["Pojedyncza Próbka (Raport Szczegółowy)", "Zbiorcza Seria Pomiarowa (Multi-Sheet)"]
+            "Wybierz zakres raportu:",
+            ["Pojedyncza Próbka (Raport Szczegółowy)", "Zbiorcza Seria Pomiarowa (Multi-Sample)"]
         )
 
     # =========================================================================
-    # TRYB 1: POJEDYNCZA PRÓBKA (RAPORT SZCZEGÓŁOWY)
+    # TRYB 1: POJEDYNCZA PRÓBKA (SZCZEGÓŁOWA ANALIZA)
     # =========================================================================
     if analysis_mode == "Pojedyncza Próbka (Raport Szczegółowy)":
         with st.sidebar:
-            selected_sheet = st.selectbox("Wybierz arkusz próbki do analizy:", available_sheets)
+            selected_single_key = st.selectbox("Wybierz próbkę do analizy:", sample_keys)
             
-        df_target = pd.read_excel(uploaded_file, sheet_name=selected_sheet, header=int(header_row_idx))
-        if skip_after_header > 0:
-            df_target = df_target.iloc[int(skip_after_header):].reset_index(drop=True)
+        t_meta = sample_registry[selected_single_key]
+        df_target = load_raw_dataframe(
+            t_meta["file"], t_meta["item"], header_row=int(header_row_idx), skip_after=int(skip_after_header)
+        )
         df_target.columns = [str(col).strip() for col in df_target.columns]
         
         res = process_tensile_dataset(
-            df_target, force_column, disp_column, force_unit, disp_unit, manual_l0, manual_s0, selected_sheet
+            df_target, force_column, disp_column, force_unit, disp_unit, manual_l0, manual_s0, selected_single_key
         )
         
         if res is None:
-            st.error("Błąd: Wybrany arkusz nie zawiera wystarczającej liczby poprawnych punktów pomiarowych.")
+            st.error("Błąd: Wybrany plik/arkusz nie zawiera wystarczającej liczby poprawnych punktów pomiarowych.")
         else:
             col1, col2, col3, col4, col5 = st.columns(5)
             col1.metric("Wytrzymałość Doraźna Rm", f"{res['Rm_MPa']:.1f} MPa")
@@ -282,11 +334,11 @@ else:
                 x=res["strain_corr_pct"],
                 y=res["stress"],
                 mode='lines',
-                name=f'Krzywa σ-ε (Próbka {selected_sheet})',
+                name=f'Krzywa σ-ε ({selected_single_key})',
                 line=dict(color='#0066cc', width=2.5)
             ))
             
-            # Ograniczona prosta offsetowa Rp0.2
+            # Ograniczona prosta offsetowa 0.2%
             rp02_target = res["Rp02_MPa"] if res["Rp02_MPa"] else (res["Rm_MPa"] * 0.8)
             max_offset_stress = min(res["Rm_MPa"] * 0.95, rp02_target * 1.15)
             max_offset_strain = (max_offset_stress / res["slope"])
@@ -300,7 +352,7 @@ else:
                 line=dict(color='rgba(230, 0, 0, 0.7)', dash='dash', width=1.8)
             ))
             
-            # Punkt Rp0.2
+            # Punkty charakterystyczne
             if res["Rp02_MPa"] and res["Rp02_strain_pct"]:
                 fig.add_trace(go.Scatter(
                     x=[res["Rp02_strain_pct"]],
@@ -312,7 +364,6 @@ else:
                     marker=dict(color='#d90429', size=9, symbol='diamond')
                 ))
                 
-            # Punkt Rm
             fig.add_trace(go.Scatter(
                 x=[res["Rm_strain_pct"]],
                 y=[res["Rm_MPa"]],
@@ -323,7 +374,6 @@ else:
                 marker=dict(color='#f77f00', size=10, symbol='circle')
             ))
             
-            # Punkt Ru
             fig.add_trace(go.Scatter(
                 x=[res["strain_corr_pct"][-1]],
                 y=[res["Ru_MPa"]],
@@ -334,24 +384,21 @@ else:
                 marker=dict(color='#2b2d42', size=9, symbol='x')
             ))
             
-            y_max_limit = float(res["Rm_MPa"] * 1.12)
-            x_max_limit = float(res["strain_corr_pct"][-1] * 1.08)
-            
             fig.update_layout(
                 title=dict(
-                    text=f"<b>Charakterystyka Rozciągania – Próbka {selected_sheet}</b>", 
+                    text=f"<b>Charakterystyka Rozciągania – {selected_single_key}</b>", 
                     font=dict(size=17, color="#f8f9fa")
                 ),
                 xaxis=dict(
-                    title="Odkształcenie skorygowane ε_corr [%]",
-                    range=[-0.5, x_max_limit],
+                    title=r"Odkształcenie skorygowane $\epsilon_{corr}$ [%]",
+                    range=[-0.5, float(res["strain_corr_pct"][-1] * 1.08)],
                     gridcolor="rgba(255, 255, 255, 0.1)",
                     zeroline=True,
                     zerolinecolor="rgba(255, 255, 255, 0.2)"
                 ),
                 yaxis=dict(
-                    title="Naprężenie inżynierskie σ [MPa]",
-                    range=[0, y_max_limit],
+                    title=r"Naprężenie inżynierskie $\sigma$ [MPa]",
+                    range=[0, float(res["Rm_MPa"] * 1.12)],
                     gridcolor="rgba(255, 255, 255, 0.1)",
                     zeroline=True,
                     zerolinecolor="rgba(255, 255, 255, 0.2)"
@@ -359,10 +406,7 @@ else:
                 hovermode="closest",
                 template="plotly_dark",
                 legend=dict(
-                    yanchor="top", 
-                    y=0.95, 
-                    xanchor="left", 
-                    x=0.03, 
+                    yanchor="top", y=0.95, xanchor="left", x=0.03,
                     bgcolor="rgba(20, 20, 20, 0.75)",
                     bordercolor="rgba(255, 255, 255, 0.15)",
                     borderwidth=1
@@ -374,31 +418,32 @@ else:
             st.plotly_chart(fig, use_container_width=True)
 
     # =========================================================================
-    # TRYB 2: ZBIORCZA SERIA POMIAROWA (MULTI-SHEET)
+    # TRYB 2: ZBIORCZA SERIA POMIAROWA (MULTI-SAMPLE)
     # =========================================================================
     else:
         with st.sidebar:
-            selected_sheets = st.multiselect(
-                "Wybierz arkusze do porównania zbiorczego:",
-                available_sheets,
-                default=available_sheets
+            selected_multi_keys = st.multiselect(
+                "Wybierz próbki do zestawienia serii:",
+                sample_keys,
+                default=sample_keys
             )
             
-        if not selected_sheets:
-            st.warning("Zaznacz co najmniej jeden arkusz do wygenerowania raportu serii.")
+        if not selected_multi_keys:
+            st.warning("Wybierz co najmniej jedną próbkę do wygenerowania raportu serii.")
         else:
             batch_results = []
             fig_cum = go.Figure()
             max_rm_overall = 0.0
             
-            for sheet in selected_sheets:
-                df_item = pd.read_excel(uploaded_file, sheet_name=sheet, header=int(header_row_idx))
-                if skip_after_header > 0:
-                    df_item = df_item.iloc[int(skip_after_header):].reset_index(drop=True)
+            for key in selected_multi_keys:
+                t_meta = sample_registry[key]
+                df_item = load_raw_dataframe(
+                    t_meta["file"], t_meta["item"], header_row=int(header_row_idx), skip_after=int(skip_after_header)
+                )
                 df_item.columns = [str(col).strip() for col in df_item.columns]
                 
                 res_item = process_tensile_dataset(
-                    df_item, force_column, disp_column, force_unit, disp_unit, manual_l0, manual_s0, sheet
+                    df_item, force_column, disp_column, force_unit, disp_unit, manual_l0, manual_s0, key
                 )
                 
                 if res_item is not None:
@@ -406,7 +451,7 @@ else:
                         max_rm_overall = res_item["Rm_MPa"]
                         
                     batch_results.append({
-                        "Próbka": f"Próbka {sheet}",
+                        "Próbka": key,
                         "Fm [kN]": round(res_item["Fm_kN"], 2),
                         "Rm [MPa]": round(res_item["Rm_MPa"], 1),
                         "Rp0.2 [MPa]": round(res_item["Rp02_MPa"], 1) if res_item["Rp02_MPa"] else np.nan,
@@ -419,23 +464,23 @@ else:
                         x=res_item["strain_corr_pct"],
                         y=res_item["stress"],
                         mode='lines',
-                        name=f'Próbka {sheet}',
+                        name=key,
                         line=dict(width=1.8)
                     ))
                     
             if not batch_results:
-                st.error("Żaden z wybranych arkuszy nie zawierał poprawnych danych.")
+                st.error("Żaden ze wskazanych plików nie zawierał poprawnych danych.")
             else:
                 df_batch = pd.DataFrame(batch_results)
                 
                 st.subheader("📈 Skumulowany Przebieg Krzywych Rozciągania Serii")
                 fig_cum.update_layout(
                     xaxis=dict(
-                        title="Odkształcenie skorygowane ε_corr [%]",
+                        title=r"Odkształcenie skorygowane $\epsilon_{corr}$ [%]",
                         gridcolor="rgba(255, 255, 255, 0.1)"
                     ),
                     yaxis=dict(
-                        title="Naprężenie inżynierskie σ [MPa]",
+                        title=r"Naprężenie inżynierskie $\sigma$ [MPa]",
                         range=[0, max_rm_overall * 1.12],
                         gridcolor="rgba(255, 255, 255, 0.1)"
                     ),
