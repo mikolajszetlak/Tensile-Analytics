@@ -8,7 +8,7 @@ import re
 
 # Konfiguracja strony
 st.set_page_config(
-    page_title="Tensile Analytics  | SZETLAK",
+    page_title="Tensile Analytics",
     layout="wide",
     initial_sidebar_state="expanded"
 )
